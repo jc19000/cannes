@@ -19,9 +19,11 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --release
+      - run: cargo clippy --all-targets --release --features io-uring
       - run: cargo test --release
+      - run: cargo test --release --features io-uring
       - run: cargo test # debug: debug assertions in the rings
-      - run: cargo doc --no-deps
+      - run: cargo doc --no-deps --features io-uring
 
   msrv:
     runs-on: ubuntu-latest

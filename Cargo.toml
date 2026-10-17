@@ -1,6 +1,6 @@
 [package]
 name = "cannes"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Thread-per-core actor engine for low-latency systems: pinned busy-polling event loops, lock-free SPSC rings between cores, ~600 ns inter-core round trip. Inspired by Tredzone simplx."
@@ -12,7 +12,14 @@ keywords = ["actor", "thread-per-core", "low-latency", "lock-free", "spsc"]
 categories = ["concurrency", "data-structures", "finance"]
 exclude = ["/bench", "/.github"]
 
+[features]
+## Per-core io_uring (Linux): network and file I/O from actors, completions delivered as events.
+io-uring = ["dep:io-uring"]
+
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [profile.release]
 opt-level = 3
@@ -23,3 +30,4 @@ debug = 1
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+features = ["io-uring"]

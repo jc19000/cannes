@@ -68,8 +68,12 @@
 //!   reference semantics, and per-core singletons ([`Context::singleton`]).
 //! - Timers built like simplx's: one service, one hub per core, one cross-core event per tick
 //!   ([`Timer`]).
+//! - Per-core idle modes ([`CoreMode`]): busy-poll, fixed sleep, or adaptive, to trade latency
+//!   for CPU.
+//! - Per-core io_uring (feature `io-uring`, Linux): network and file I/O from actors, completions
+//!   delivered as events (`Context::io`, `IoCompletion`).
 //! - Per-core performance counters ([`CoreCounters`]): loop saturation, events, batching factor,
-//!   bytes per destination core.
+//!   bytes per destination core, sleeps, CPU time.
 //!
 //! ## What the compiler checks for you
 //!
@@ -90,11 +94,16 @@
 pub mod affinity;
 pub mod bytering;
 pub mod engine;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub mod io;
 pub mod spsc;
+mod sys;
 pub mod timer;
 
 pub use engine::{
-    Actor, ActorId, ActorRef, Context, CoreCounters, CoreId, Engine, Event, Handler, ReferenceError, StartSequence,
-    UndeliveredHandler,
+    Actor, ActorId, ActorRef, Context, CoreCounters, CoreId, CoreMode, Engine, Event, Handler, ReferenceError,
+    StartSequence, UndeliveredHandler,
 };
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use io::{Io, IoCompletion};
 pub use timer::{NoTimerService, Timeout, Timer, TimerService, TimerServiceTag};

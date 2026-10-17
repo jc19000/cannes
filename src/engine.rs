@@ -42,9 +42,13 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::affinity;
 use crate::bytering::{self, Consumer, Producer, RECORD_ALIGN};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use crate::io::{Io, IoRing};
+use crate::sys;
 
 /// CPU core number, as used by the OS for pinning.
 pub type CoreId = usize;
@@ -431,6 +435,37 @@ pub struct CoreCounters {
     /// Bytes of event records written towards each core (headers included), by core id; the
     /// entry of this core counts local events.
     pub bytes_written_to: Vec<u64>,
+    /// Times the loop went to sleep (`CoreMode::Sleep` / `CoreMode::Adaptive`).
+    pub sleeps: u64,
+    /// Wall-clock time spent sleeping, in nanoseconds.
+    pub slept_ns: u64,
+    /// CPU time consumed by the core's thread, in nanoseconds (Linux; 0 elsewhere). Updated when
+    /// the counters are published, exact at shutdown. `cpu_ns` over elapsed time is the share of
+    /// the core actually burnt.
+    pub cpu_ns: u64,
+}
+
+/// How an event loop waits when it has nothing to do. Set per core with
+/// `StartSequence::core_mode`.
+///
+/// A sleeping loop is not woken up by incoming events: it finds them when the sleep ends. The
+/// sleep duration is therefore added to the latency of events reaching an idle core, and to the
+/// precision of timers served from that core. Senders are not affected: publishing is unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoreMode {
+    /// Busy-poll forever: lowest latency, 100 % of the core at all times. The default.
+    #[default]
+    Spin,
+    /// Sleep for this long after every iteration that handled no event.
+    Sleep(Duration),
+    /// Busy-poll while events keep coming; once `idle_loops` consecutive iterations handled no
+    /// event, sleep for `sleep` after each further idle iteration, until an event shows up.
+    Adaptive {
+        /// Consecutive idle iterations before sleeping.
+        idle_loops: u32,
+        /// Sleep duration once idle.
+        sleep: Duration,
+    },
 }
 
 #[repr(align(128))]
@@ -479,6 +514,9 @@ pub struct Context {
 
     counters: CoreCounters,
     active: bool, // an actor callback ran in this iteration
+
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    io: Option<IoRing>,
 }
 
 impl Context {
@@ -634,6 +672,25 @@ impl Context {
         &self.counters
     }
 
+    /// Submits I/O on this core's io_uring on behalf of the current actor; `None` if the core
+    /// has no ring (see `StartSequence::io_uring`). Feature `io-uring`, Linux only.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub fn io(&mut self) -> Option<Io<'_>> {
+        let owner = self.current;
+        self.io.as_mut().map(|ring| Io { ring, owner })
+    }
+
+    /// Idle wait: in io_uring if the core has one (an I/O completion ends it early), else a plain
+    /// sleep.
+    fn sleep(&mut self, d: Duration) {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if let Some(ring) = self.io.as_mut() {
+            ring.wait(d);
+            return;
+        }
+        thread::sleep(d);
+    }
+
     #[inline]
     fn alloc_record(&mut self, core: u16, len: usize) -> *mut u8 {
         if core == self.core {
@@ -730,6 +787,8 @@ pub struct StartSequence {
     used: Vec<bool>,
     services: HashMap<TypeId, ActorId>,
     ring_capacity: usize,
+    modes: Vec<CoreMode>,
+    io_entries: Vec<u32>,
 }
 
 impl Default for StartSequence {
@@ -747,6 +806,8 @@ impl StartSequence {
             used: Vec::new(),
             services: HashMap::new(),
             ring_capacity: 64 * 1024,
+            modes: Vec::new(),
+            io_entries: Vec::new(),
         }
     }
 
@@ -761,8 +822,25 @@ impl StartSequence {
         if self.per_core.len() <= core {
             self.per_core.resize(core + 1, 0);
             self.used.resize(core + 1, false);
+            self.modes.resize(core + 1, CoreMode::Spin);
+            self.io_entries.resize(core + 1, 0);
         }
         self.used[core] = true;
+    }
+
+    /// How the event loop of `core` waits when idle (`CoreMode::Spin` by default). Also makes
+    /// `core` part of the engine.
+    pub fn core_mode(&mut self, core: CoreId, mode: CoreMode) {
+        self.add_core(core);
+        self.modes[core] = mode;
+    }
+
+    /// Gives `core` an io_uring with `entries` submission slots, used by its actors through
+    /// `Context::io()`. Feature `io-uring`, Linux only.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub fn io_uring(&mut self, core: CoreId, entries: u32) {
+        self.add_core(core);
+        self.io_entries[core] = entries.max(1);
     }
 
     /// Registers an actor built on `core` when the engine starts; returns its id.
@@ -805,7 +883,7 @@ impl Engine {
     /// Starts one event loop per core of the start sequence; returns once every start actor has
     /// been built and started.
     pub fn start(sequence: StartSequence) -> Engine {
-        let StartSequence { entries, per_core, used, services, ring_capacity } = sequence;
+        let StartSequence { entries, per_core, used, services, ring_capacity, modes, io_entries } = sequence;
         let n = per_core.len();
         let cores: Vec<CoreId> = (0..n).filter(|&c| used[c]).collect();
 
@@ -846,6 +924,8 @@ impl Engine {
             .map(|&core| {
                 let loop_state = CoreLoop {
                     core,
+                    mode: modes[core],
+                    io_entries: io_entries[core],
                     entries: per_core_entries[core].take().unwrap(),
                     inbound: inbound[core].take().unwrap(),
                     outbound: outbound[core].take().unwrap(),
@@ -936,6 +1016,8 @@ fn find(table: &[(TypeId, Thunk)], type_id: TypeId) -> Option<Thunk> {
 
 struct CoreLoop {
     core: CoreId,
+    mode: CoreMode,
+    io_entries: u32,
     entries: Vec<StartEntry>,
     inbound: Vec<Consumer>,
     outbound: Vec<Option<Producer>>,
@@ -1128,9 +1210,14 @@ impl Actors {
 
 impl CoreLoop {
     fn run(self) {
-        let CoreLoop { core, entries, mut inbound, outbound, shared, started } = self;
+        let CoreLoop { core, mode, io_entries, entries, mut inbound, outbound, shared, started } = self;
+        #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+        let _ = io_entries;
         if let Err(e) = affinity::pin_current_thread(core) {
             eprintln!("warning: could not pin engine thread to core {core}: {e}");
+        }
+        if mode != CoreMode::Spin {
+            sys::minimize_timer_slack();
         }
         let n = outbound.len();
         let mut ctx = Context {
@@ -1154,6 +1241,10 @@ impl CoreLoop {
             singletons: HashMap::new(),
             counters: CoreCounters { core, bytes_written_to: vec![0; n], ..CoreCounters::default() },
             active: false,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io: (io_entries > 0).then(|| {
+                IoRing::new(io_entries).unwrap_or_else(|e| panic!("io_uring setup failed on core {core}: {e}"))
+            }),
         };
         let mut actors = Actors { slots: Vec::new() };
 
@@ -1169,7 +1260,20 @@ impl CoreLoop {
         let shared = ctx.shared.clone(); // read-only from here on; cloning per iteration would bounce the refcount line
         let mut local = RecordBuf::default();
         let mut iteration: u64 = 0;
+        let mut idle_iterations: u32 = 0;
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        let mut io_done: Vec<(ActorId, crate::io::IoCompletion)> = Vec::new();
         loop {
+            let events_before = ctx.counters.events;
+            // I/O completions become local events, dispatched in this iteration.
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            if let Some(ring) = ctx.io.as_mut() {
+                ring.submit();
+                ring.drain(|owner, completion| io_done.push((owner, completion)));
+                for (owner, completion) in io_done.drain(..) {
+                    ctx.send_from(ActorId::NULL, owner, completion);
+                }
+            }
             for consumer in inbound.iter_mut() {
                 let mut any = false;
                 while let Some((record, len)) = consumer.peek() {
@@ -1198,20 +1302,44 @@ impl CoreLoop {
             }
             actors.run_destroy_requests(&mut ctx, &shared.0);
             ctx.flush();
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            if let Some(ring) = ctx.io.as_mut() {
+                ring.submit();
+            }
             iteration += 1;
             ctx.counters.loop_total += 1;
             ctx.counters.loop_usage += ctx.active as u64;
             ctx.active = false;
             if ctx.counters.loop_total % COUNTERS_PUBLISH_PERIOD == 0 {
+                ctx.counters.cpu_ns = sys::thread_cpu_ns();
                 // try_lock: never wait for a reader on the hot path, publish next time instead.
                 if let Ok(mut published) = shared.0.counters[core].0.try_lock() {
                     published.clone_from(&ctx.counters);
+                }
+            }
+            // Idle-time policy. Everything sent in this iteration is already published above.
+            if mode != CoreMode::Spin {
+                idle_iterations =
+                    if ctx.counters.events == events_before { idle_iterations.saturating_add(1) } else { 0 };
+                let sleep = match mode {
+                    CoreMode::Sleep(d) if idle_iterations > 0 => Some(d),
+                    CoreMode::Adaptive { idle_loops, sleep } if idle_iterations > idle_loops => Some(sleep),
+                    _ => None,
+                };
+                if let Some(d) = sleep {
+                    if ctx.local.is_empty() {
+                        let start = Instant::now();
+                        ctx.sleep(d);
+                        ctx.counters.sleeps += 1;
+                        ctx.counters.slept_ns += start.elapsed().as_nanos() as u64;
+                    }
                 }
             }
             if shared.0.live_total.load(Ordering::Acquire) == 0 && ctx.local.is_empty() {
                 break;
             }
         }
+        ctx.counters.cpu_ns = sys::thread_cpu_ns();
         shared.0.counters[core].0.lock().unwrap().clone_from(&ctx.counters);
 
         // No actor left anywhere, so nothing can handle an event anymore: drop whatever arrives,

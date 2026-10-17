@@ -103,7 +103,9 @@ fn main() {
 
 ```toml
 [dependencies]
-cannes = "0.1"
+cannes = "0.2"
+# or, for network and file I/O from actors (Linux):
+# cannes = { version = "0.2", features = ["io-uring"] }
 ```
 
 ## Features
@@ -117,7 +119,9 @@ cannes = "0.1"
 | **Direct calls** | `ActorRef<A>`: synchronous method calls between actors of the same core, destruction blocked while referenced, circular references refused, per-core singletons |
 | **Timers** | One timer service, one hub per core, one cross-core event per tick whatever the number of timers |
 | **Flush** | End-of-iteration publication, plus `ctx.flush()` to publish immediately |
-| **Counters** | Per core: loop iterations, busy iterations (saturation), events, callbacks, ring publications (batching factor), bytes per destination core |
+| **Idle modes** | Per core: `Spin` (lowest latency), `Sleep(d)`, or `Adaptive` (spin while events keep coming, sleep after N idle loops), to trade latency for CPU |
+| **io_uring** (feature `io-uring`) | One ring per core: accept, recv, send, read, write, close from actors, completions delivered as events, zero-copy buffer hand-back; a sleeping core is woken by I/O at once |
+| **Counters** | Per core: loop iterations, busy iterations (saturation), events, callbacks, ring publications (batching factor), bytes per destination core, sleeps, CPU time |
 | **Shutdown** | Regular actors first, then services; every in-flight event is dropped exactly once |
 
 ### What the compiler checks for you
@@ -152,11 +156,14 @@ bench/compare_simplx.sh # also builds simplx and runs the same benchmark in C++
 Why simplx is slower, how a false-sharing bug once cost 300 ns per round trip, and what one
 extra write per loop iteration costs: [docs/DESIGN.md](docs/DESIGN.md).
 
+CPU cost vs. latency of each idle mode under load, and the io_uring integration:
+[docs/MODES_AND_IO.md](docs/MODES_AND_IO.md).
+
 ## Status and limits
 
-- Young (0.1): API may change. 22 tests, including cross-core stress, overflow ordering, and
+- Young (0.2): API may change. 28 tests (25 without `io-uring`), including cross-core stress, overflow ordering, idle modes, a TCP echo server, and
   drop accounting at shutdown.
-- Linux for thread pinning (elsewhere, loops run unpinned). Busy-polling: each engine core runs
+- Linux for thread pinning and io_uring (elsewhere, loops run unpinned). In `Spin` mode each engine core runs
   at 100 % by design.
 - Bounded rings (64 KiB by default) with local overflow when full; an event can be at most half a
   ring.
