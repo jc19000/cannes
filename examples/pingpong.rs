@@ -4,12 +4,14 @@
 //! - `raw`: two bare pinned threads and two SPSC rings, no engine: the floor for this hardware.
 //!
 //! One event in flight at a time; each round trip is timed with rdtsc, calibrated against
-//! `Instant` over the run.
+//! `Instant` over the run. Off x86_64 the tick source falls back to `Instant` (nanoseconds),
+//! which is coarser and slower to read than rdtsc.
 //!
 //! usage: cargo run --release --example pingpong -- [iterations=1000000] [warmup=100000] [ping_core=1] [pong_core=2] [engine|raw]
 
-use std::arch::x86_64::_rdtsc;
 use std::sync::mpsc;
+#[cfg(not(target_arch = "x86_64"))]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
 
@@ -22,9 +24,18 @@ struct PingEvent {
     t0: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn rdtsc() -> u64 {
-    unsafe { _rdtsc() }
+    unsafe { std::arch::x86_64::_rdtsc() }
+}
+
+/// Fallback tick source: nanoseconds since the first call.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn rdtsc() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 struct Results {
